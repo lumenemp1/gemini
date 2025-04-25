@@ -20,7 +20,7 @@ DB_URI            = "mysql+pymysql://root:admin@localhost/chatbot"
 DIALECT           = "MySQL"  # Injected dialect for prompt
 
 # Gemini API settings (hard-coded)
-GEMINI_API_KEY    = "AIzaSyCq9VJXkGpDInmioeRrcj1k-BRa57FcXzs"
+GEMINI_API_KEY    = ""
 GEMINI_MODEL      = "gemini-2.0-flash"
 GEMINI_URL        = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
