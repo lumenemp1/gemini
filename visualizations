@@ -1,0 +1,598 @@
+import os
+import json
+import re
+import numpy as np
+import faiss
+import requests
+from sentence_transformers import SentenceTransformer
+from sqlalchemy import create_engine, text
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+# ----------------------------------------------------------------------
+# Configuration – edit paths / model names/dialect here
+# ----------------------------------------------------------------------
+INDEX_PATH        = "schema_index/faiss_index.bin"
+META_PATH         = "schema_index/table_metadata.json"
+EMBED_MODEL_NAME  = "BAAI/bge-small-en"
+TOP_K             = 3
+DB_URI            = "mysql+pymysql://root:admin@localhost/chatbot"
+DIALECT           = "MySQL"  # Injected dialect for prompt
+
+# Gemini API settings (hard-coded)
+GEMINI_API_KEY    = "AIzaSyCq9VJXkGpDInmioeRrcj1k-BRa57FcXzs"
+GEMINI_MODEL      = "gemini-2.0-flash"
+GEMINI_URL        = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+)
+
+# ----------------------------------------------------------------------
+# Prompt Template with system instruction to limit output to SQL
+# ----------------------------------------------------------------------
+PROMPT_TEMPLATE = """
+You are a database assistant. Only provide the SQL query without any explanations or extra text.
+
+### Task
+Generate a {dialect}-compatible SQL query to answer the following question:
+{question}
+
+### Database Schema
+The query will run on a {dialect} database with the following schema:
+{schema}
+
+### Guidelines
+1. Ensure the query is fully compatible with {dialect}.
+2. Avoid unsupported syntax (e.g., `NULLS LAST`).
+3. Handle `NULL` explicitly (e.g., `CASE WHEN`).
+
+### SQL Query
+```sql
+"""
+
+# ----------------------------------------------------------------------
+# Load FAISS + metadata (unchanged)
+# ----------------------------------------------------------------------
+
+def load_faiss_and_metadata(index_path, meta_path):
+    index = faiss.read_index(index_path)
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    return index, meta
+
+
+def build_reverse_fk_map(metadata):
+    rev = {m["table_name"]: set() for m in metadata.values()}
+    fk_re = re.compile(r"REFERENCES\s+`?(\w+)`?", re.IGNORECASE)
+    for m in metadata.values():
+        for ref in fk_re.findall(m["create_stmt"]):
+            if ref in rev:
+                rev[ref].add(m["table_name"])
+    return rev
+
+
+def parse_forward_fks(ddl):
+    return set(re.findall(r"REFERENCES\s+`?(\w+)`?", ddl, flags=re.IGNORECASE))
+
+
+def semantic_search(q, embed_model, faiss_index, top_k):
+    emb = embed_model.encode(q)
+    D, I = faiss_index.search(np.array([emb], dtype="float32"), top_k)
+    return I[0]
+
+
+def expand_with_related(idxs, metadata, rev_map):
+    tables = {metadata[str(i)]["table_name"] for i in idxs}
+    extra = set()
+    for i in idxs:
+        m = metadata[str(i)]
+        extra |= parse_forward_fks(m["create_stmt"])
+        extra |= rev_map.get(m["table_name"], set())
+    return tables | extra
+
+
+def build_schema_snippet(tables, metadata):
+    return "\n\n".join(
+        m["create_stmt"] for m in metadata.values() if m["table_name"] in tables
+    )
+
+# ----------------------------------------------------------------------
+# Gemini integration (enhanced parsing for nested 'parts')
+# ----------------------------------------------------------------------
+def generate_sql_with_gemini(full_prompt: str) -> str:
+    """
+    Sends the prompt to Gemini API and returns the generated SQL string.
+    Handles various response formats, including nested 'parts'.
+    """
+    payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+    headers = {"Content-Type": "application/json"}
+    resp = requests.post(GEMINI_URL, headers=headers, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Top-level 'candidates' list
+    if "candidates" in data and isinstance(data["candidates"], list):
+        candidate = data["candidates"][0]
+        # If content is a dict with 'parts'
+        if isinstance(candidate.get("content"), dict) and "parts" in candidate["content"]:
+            parts = candidate["content"]["parts"]
+            if parts and isinstance(parts[0].get("text"), str):
+                return parts[0]["text"]
+        # If content is a string
+        if isinstance(candidate.get("content"), str):
+            return candidate["content"]
+        # Other possible fields
+        for key in ("text", "output"):  
+            if isinstance(candidate.get(key), str):
+                return candidate[key]
+    # Fallback: direct top-level
+    for key in ("content", "text"):  
+        if isinstance(data.get(key), str):
+            return data[key]
+
+    # If none matched, raise with full JSON for debugging
+    raise ValueError(f"Unexpected Gemini response format: {json.dumps(data)}")
+
+# ----------------------------------------------------------------------
+# Public Init and Inference
+# ----------------------------------------------------------------------
+def init_models():
+    global _faiss_index, _metadata, _rev_fk_map, _embed_model
+    print("🔧 Initializing FAISS and Embeddings…")
+    _faiss_index, _metadata = load_faiss_and_metadata(INDEX_PATH, META_PATH)
+    _rev_fk_map = build_reverse_fk_map(_metadata)
+    _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    print("✅ FAISS and Embeddings ready!")
+
+
+# ----------------------------------------------------------------------
+# Enhanced Visualization Prompt Template (WITH results)
+# ----------------------------------------------------------------------
+VIZ_PROMPT_TEMPLATE = """
+You are a data visualization expert. Analyze the provided database schema, user question, SQL query, and query results to recommend the best visualization types.
+
+### User Question
+{question}
+
+### Database Schema
+{schema}
+
+### SQL Query Used
+{sql}
+
+### Query Results (first 5 rows)
+{results}
+
+### Guidelines
+1. Based on the data structure, query results, and question intent, suggest appropriate chart types (bar, line, pie, scatter, etc.)
+2. Identify which columns from the results should be visualized
+3. Provide clear reasoning why these visualizations are appropriate for this data
+4. Only suggest visualizations if there are at least 2 rows of data
+5. For single-row results, no visualization is needed, return empty array
+
+### Response Format
+Return ONLY a JSON object with the following structure:
+```json
+{
+  "visualizations": [
+    {
+      "chart_type": "type of chart (bar, line, pie, scatter, etc.)",
+      "columns": {
+        "x": "column name for x-axis or categories",
+        "y": "column name for y-axis or values",
+        "color": "optional column for color differentiation"
+      },
+      "reasoning": "brief explanation of why this visualization is appropriate"
+    }
+  ]
+}
+```
+"""
+def generate_viz_with_gemini(full_prompt: str) -> str:
+    """
+    Sends the visualization prompt to Gemini API and returns the generated suggestions.
+    Enhanced with detailed response logging for debugging.
+    """
+    # Same API call as before
+    payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+    headers = {"Content-Type": "application/json"}
+    
+    print("\n===== SENDING REQUEST TO GEMINI API =====")
+    print(f"Prompt (truncated): {full_prompt[:300]}...\n")
+    
+    resp = requests.post(GEMINI_URL, headers=headers, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+    
+    print("\n===== RECEIVED RAW RESPONSE FROM GEMINI API =====")
+    print(f"Response status code: {resp.status_code}")
+    print(f"Full JSON response:\n{json.dumps(data, indent=2)}\n")
+    
+    # Enhanced response parsing with logging
+    if "candidates" in data and isinstance(data["candidates"], list):
+        candidate = data["candidates"][0]
+        if isinstance(candidate.get("content"), dict) and "parts" in candidate["content"]:
+            parts = candidate["content"]["parts"]
+            if parts and isinstance(parts[0].get("text"), str):
+                text_response = parts[0]["text"]
+                print("\n===== EXTRACTED TEXT RESPONSE =====")
+                print(f"Full text response:\n{text_response}\n")
+                return text_response
+    
+    # More robust fallback handling with logging
+    for container in ["candidates", "content", "parts"]:
+        if container in data and isinstance(data[container], list) and data[container]:
+            if isinstance(data[container][0], dict) and "text" in data[container][0]:
+                text_response = data[container][0]["text"]
+                print(f"\n===== EXTRACTED TEXT RESPONSE (from {container}) =====")
+                print(f"Full text response:\n{text_response}\n")
+                return text_response
+    
+    # Final fallback - return the entire response as a string for debugging
+    print("\n===== FALLBACK: RETURNING FULL JSON AS STRING =====")
+    return json.dumps(data)
+
+def get_visualization_suggestions(question, schema, sql, results):
+    """
+    Gets visualization suggestions from Gemini based on the query structure and results.
+    Improved JSON handling and debugging.
+    """
+    # Format sample results to include in the prompt
+    sample_results = json.dumps(results[:5], indent=2) if results else "[]"
+    
+    # Format the prompt
+    prompt = VIZ_PROMPT_TEMPLATE.format(
+        question=question,
+        schema=schema,
+        sql=sql,
+        results=sample_results
+    )
+    
+    # Debug the prompt
+    print(f"Visualization prompt (first 200 chars): {prompt[:200]}...")
+    
+    # Get response from Gemini
+    viz_output = generate_viz_with_gemini(prompt)
+    
+    # Debug raw response
+    print(f"Raw visualization response (first 500 chars): {viz_output[:500]}...")
+    
+    # Improved JSON extraction and parsing
+    try:
+        # First check if the response is already valid JSON
+        try:
+            return json.loads(viz_output)
+        except json.JSONDecodeError:
+            pass
+            
+        # Look for JSON between code fences
+        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', viz_output, re.DOTALL | re.IGNORECASE)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError as e:
+                print(f"Found JSON in code fence but couldn't parse: {str(e)}")
+                print(f"Extracted JSON: {json_match.group(1)[:200]}...")
+        
+        # Try to find a JSON object with more permissive pattern
+        # This pattern looks for any text that starts with { and ends with }
+        json_objects = re.findall(r'(\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\})', viz_output)
+        if json_objects:
+            # Try each found JSON object
+            for json_obj in json_objects:
+                try:
+                    result = json.loads(json_obj)
+                    # Check if it's in our expected format
+                    if isinstance(result, dict) and "visualizations" in result:
+                        return result
+                except:
+                    continue
+                    
+        # If we get here, try to manually construct JSON from the response
+        # Look for patterns that suggest chart recommendations
+        chart_types = ["bar", "line", "pie", "scatter", "histogram", "box", "heatmap"]
+        visualizations = []
+        
+        # Check if any chart types are mentioned in the response
+        for chart_type in chart_types:
+            if chart_type in viz_output.lower():
+                # Look for column references near the chart type
+                cols_pattern = re.compile(r'(?:' + chart_type + r'.*?)(x|y|color)(?:\s*:|=\s*)["\'](.*?)["\']', re.IGNORECASE)
+                cols_matches = cols_pattern.findall(viz_output)
+                
+                columns = {}
+                for axis, col in cols_matches:
+                    columns[axis.lower()] = col
+                
+                # If we found at least x or y axis
+                if 'x' in columns or 'y' in columns:
+                    # Set defaults if missing
+                    x_col = columns.get('x', list(results[0].keys())[0] if results else "")
+                    y_col = columns.get('y', list(results[0].keys())[1] if len(results[0].keys()) > 1 and results else "")
+                    
+                    visualizations.append({
+                        "chart_type": chart_type,
+                        "columns": {
+                            "x": x_col,
+                            "y": y_col,
+                            "color": columns.get('color')
+                        },
+                        "reasoning": f"Auto-detected {chart_type} chart from model response"
+                    })
+        
+        # If we found any visualizations, return them
+        if visualizations:
+            return {"visualizations": visualizations}
+        
+        # Last resort: generate fallback visualizations based on data structure
+        return generate_fallback_visualizations(results)
+                
+    except Exception as e:
+        print(f"Error processing visualization suggestions: {str(e)}")
+        # Provide a detailed traceback for debugging
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return generate_fallback_visualizations(results)
+
+def generate_fallback_visualizations(results):
+    """
+    Generate basic visualization suggestions based on data structure alone.
+    """
+    if not results or len(results) < 2:
+        return {"visualizations": []}
+        
+    # Get column names from first result
+    columns = list(results[0].keys())
+    
+    # Look for numeric columns to use as values
+    numeric_cols = []
+    categorical_cols = []
+    
+    for col in columns:
+        # Check the data type in the first few rows to determine column type
+        for row in results[:5]:
+            if row[col] is not None:
+                if isinstance(row[col], (int, float)):
+                    if col not in numeric_cols:
+                        numeric_cols.append(col)
+                else:
+                    if col not in categorical_cols:
+                        categorical_cols.append(col)
+    
+    visualizations = []
+    
+    # If we have at least one numeric and one categorical column
+    if numeric_cols and categorical_cols:
+        # Bar chart showing quantity by product
+        visualizations.append({
+            "chart_type": "bar",
+            "columns": {
+                "x": categorical_cols[0],
+                "y": numeric_cols[0],
+                "color": categorical_cols[1] if len(categorical_cols) > 1 else None
+            },
+            "reasoning": f"Bar chart showing {numeric_cols[0]} by {categorical_cols[0]}"
+        })
+        
+        # Pie chart for proportion analysis
+        visualizations.append({
+            "chart_type": "pie",
+            "columns": {
+                "x": categorical_cols[0],
+                "y": numeric_cols[0]
+            },
+            "reasoning": f"Pie chart showing proportion of total {numeric_cols[0]} by {categorical_cols[0]}"
+        })
+    
+    return {"visualizations": visualizations}
+# ----------------------------------------------------------------------
+# Plotly Visualization Generation
+# ----------------------------------------------------------------------
+def generate_plotly_chart(chart_type, columns, data):
+    """
+    Generate a plotly chart based on chart type and column specifications.
+    Returns JSON for the plotly figure.
+    """
+    import plotly.graph_objects as go
+    import plotly.express as px
+    import pandas as pd
+    
+    # Convert dict data to pandas DataFrame for easier manipulation
+    df = pd.DataFrame(data)
+    
+    if not data or not df.shape[0]:
+        return {"error": "No data available for visualization"}
+    
+    # Make sure all required columns exist
+    x_col = columns.get('x')
+    y_col = columns.get('y')
+    color_col = columns.get('color')
+    
+    # Validate columns exist in the data
+    if x_col and x_col not in df.columns:
+        return {"error": f"Column '{x_col}' not found in results"}
+    if y_col and y_col not in df.columns:
+        return {"error": f"Column '{y_col}' not found in results"}
+    if color_col and color_col not in df.columns:
+        # Color is optional, so just ignore if not present
+        color_col = None
+    
+    try:
+        # Create the appropriate chart based on type
+        chart_type = chart_type.lower()
+        fig = None
+        
+        if chart_type == "bar":
+            if color_col:
+                fig = px.bar(df, x=x_col, y=y_col, color=color_col)
+            else:
+                fig = px.bar(df, x=x_col, y=y_col)
+                
+        elif chart_type == "line":
+            if color_col:
+                fig = px.line(df, x=x_col, y=y_col, color=color_col)
+            else:
+                fig = px.line(df, x=x_col, y=y_col)
+                
+        elif chart_type == "scatter":
+            if color_col:
+                fig = px.scatter(df, x=x_col, y=y_col, color=color_col)
+            else:
+                fig = px.scatter(df, x=x_col, y=y_col)
+                
+        elif chart_type == "pie":
+            fig = px.pie(df, names=x_col, values=y_col)
+            
+        elif chart_type == "histogram":
+            fig = px.histogram(df, x=x_col)
+            
+        elif chart_type == "box":
+            if color_col:
+                fig = px.box(df, x=x_col, y=y_col, color=color_col)
+            else:
+                fig = px.box(df, x=x_col, y=y_col)
+                
+        elif chart_type == "heatmap":
+            # Pivot data if needed
+            pivot_df = df.pivot(index=x_col, columns=color_col, values=y_col) if color_col else df
+            fig = px.imshow(pivot_df)
+            
+        else:
+            # Default to bar chart if type not recognized
+            fig = px.bar(df, x=x_col, y=y_col)
+            
+        # Return the plotly figure as JSON
+        return fig.to_dict()
+        
+    except Exception as e:
+        return {"error": f"Error generating {chart_type} chart: {str(e)}"}
+
+# ----------------------------------------------------------------------
+# Generate all visualizations from recommendations
+# ----------------------------------------------------------------------
+def create_visualizations(viz_suggestions, data):
+    """
+    Create all visualizations based on the recommendations
+    """
+    charts = []
+    
+    # Handle error cases
+    if isinstance(viz_suggestions, dict) and "error" in viz_suggestions:
+        return {"error": viz_suggestions["error"]}
+    
+    # Get the visualization recommendations
+    visualizations = viz_suggestions.get("visualizations", [])
+    
+    # Process each visualization recommendation
+    for viz in visualizations:
+        chart_type = viz.get("chart_type")
+        columns = viz.get("columns", {})
+        reasoning = viz.get("reasoning", "")
+        
+        # Generate the chart
+        chart = generate_plotly_chart(chart_type, columns, data)
+        
+        # Add to our collection with metadata
+        charts.append({
+            "chart_type": chart_type,
+            "columns": columns,
+            "reasoning": reasoning,
+            "plotly_figure": chart
+        })
+    
+    return charts
+
+# ----------------------------------------------------------------------
+# Updated process_question function
+# ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Updated process_question function
+# ----------------------------------------------------------------------
+def process_question(question: str) -> dict:
+    try:
+        # 1) semantic search for relevant tables
+        idxs        = semantic_search(question, _embed_model, _faiss_index, TOP_K)
+        tables      = expand_with_related(idxs, _metadata, _rev_fk_map)
+        schema_text = build_schema_snippet(tables, _metadata)
+        
+        # 2) format prompt
+        prompt = PROMPT_TEMPLATE.format(
+            question=question,
+            schema=schema_text,
+            dialect=DIALECT
+        )
+        
+        # 3) get SQL from Gemini
+        gen_output = generate_sql_with_gemini(prompt)
+       
+            
+        # 4) clean fences
+        final_sql = gen_output.strip().lstrip("```sql").rstrip("```").strip()
+        
+        # Check if SQL was actually generated
+        if not final_sql or len(final_sql) < 10:  # Basic sanity check
+            return {
+                "sql": None, 
+                "results": [], 
+                "error": "No valid SQL query was generated",
+                "visualization_suggestions": None,
+                "charts": None
+            }
+        
+        # 5) execute SQL
+        try:
+            engine = create_engine(DB_URI)
+            with engine.connect() as conn:
+                rows = [dict(r._mapping) for r in conn.execute(text(final_sql)).fetchall()]
+        except Exception as sql_error:
+            return {
+                "sql": final_sql, 
+                "results": [], 
+                "error": f"SQL execution error: {str(sql_error)}",
+                "visualization_suggestions": None,
+                "charts": None
+            }
+        
+        # 6) Get visualization suggestions - UPDATED to include results data
+        try:
+            # Only get visualization suggestions if we have enough data
+            if len(rows) >= 2:  # Need at least 2 rows for most visualizations
+                viz_suggestions = get_visualization_suggestions(
+                    question=question,
+                    schema=schema_text,
+                    sql=final_sql,
+                    results=rows  # Pass the actual results to the visualization function
+                )
+            else:
+                # For single row results, skip visualization
+                viz_suggestions = {"visualizations": []}
+                print(f"Not enough data for visualization ({len(rows)} rows). Skipping.")
+        except Exception as viz_error:
+            viz_suggestions = {"visualizations": []}
+            print(f"Visualization suggestion error: {str(viz_error)}")
+        
+        # 7) Generate visualizations using plotly - with better error handling
+        try:
+            charts = create_visualizations(viz_suggestions, rows)
+        except Exception as chart_error:
+            charts = []
+            print(f"Chart generation error: {str(chart_error)}")
+        
+        # 8) Return all information
+        return {
+            "sql": final_sql, 
+            "results": rows,
+            "visualization_suggestions": viz_suggestions,
+            "charts": charts
+        }
+    except Exception as e:
+        import traceback
+        traceback_str = traceback.format_exc()
+        print(f"Error in process_question: {traceback_str}")
+        return {
+            "sql": None, 
+            "results": [], 
+            "error": str(e),
+            "visualization_suggestions": None,
+            "charts": None
+        }
